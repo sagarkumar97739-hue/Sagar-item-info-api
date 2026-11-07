@@ -1,7 +1,13 @@
 {
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/app"
+    }
+  ],
   "functions": {
-    "api/index.py": {
-      "includeFiles": ["main.json"]
+    "api/app.py": {
+      "includeFiles": ["main.json", "background/**"]
     }
   }
 }
