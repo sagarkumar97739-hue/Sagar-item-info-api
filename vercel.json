@@ -1,18 +1,7 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": {
-        "includeFiles": [
-          "main.json",
-          "background/**"
-        ]
-      }
+  "functions": {
+    "api/app.py": {
+      "includeFiles": ["main.json", "background/**"]
     }
-  ],
-  "routes": [
-    { "src": "/(.*)", "dest": "api/index.py" }
-  ]
+  }
 }
