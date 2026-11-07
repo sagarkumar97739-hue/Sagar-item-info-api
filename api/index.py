@@ -1,186 +1,240 @@
-import io
-import json
-import logging
 import os
-import re
-from pathlib import Path
-
+import json
+import io
+from flask import Flask, request, send_file, jsonify, redirect, abort
+from PIL import Image
 import requests
-from flask import Flask, abort, jsonify, redirect, request, send_file
-from PIL import Image, UnidentifiedImageError
 
 app = Flask(__name__)
-BASE_DIR = Path(__file__).resolve().parent
-ITEM_DATA_FILE = BASE_DIR / "main.json"
-BACKGROUND_FOLDER = BASE_DIR / "background"
-DEFAULT_BACKGROUND_IMAGE = BACKGROUND_FOLDER / "Default.png"
-REQUEST_TIMEOUT = (5, 15)
 
-_item_data = None
+# Configuration
+ITEM_DATA_FILE = 'main.json'
+BACKGROUND_FOLDER = 'background'
+DEFAULT_BACKGROUND_IMAGE = os.path.join(BACKGROUND_FOLDER, 'Default.png')
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def load_item_data():
-    """Load item data once per serverless instance."""
-    global _item_data
-    if _item_data is not None:
-        return _item_data
+# Global state
+item_data = None
+item_data_error = None
+
+def load_item_data(force=False):
+    """Loads item data from main.json with clear error reporting."""
+    global item_data, item_data_error
+
+    if item_data is not None and not force:
+        return item_data
+
+    file_path = os.path.join(BASE_DIR, ITEM_DATA_FILE)
+    app.logger.info(f"[loader] Looking for {ITEM_DATA_FILE} at {file_path}")
+    print(f"[loader] Looking for {ITEM_DATA_FILE} at {file_path}")
+
+    if not os.path.exists(file_path):
+        item_data_error = f"{ITEM_DATA_FILE} not found at {file_path}"
+        app.logger.error(f"[loader] {item_data_error}")
+        print(f"[loader] {item_data_error}")
+        return None
 
     try:
-        with ITEM_DATA_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-        if not isinstance(data, list):
-            raise ValueError("main.json must contain a JSON array")
-        _item_data = data
-        app.logger.info("Loaded %s items from main.json", len(data))
-        return _item_data
-    except FileNotFoundError:
-        app.logger.exception("main.json is missing: %s", ITEM_DATA_FILE)
-    except (json.JSONDecodeError, ValueError):
-        app.logger.exception("main.json is invalid")
-    except OSError:
-        app.logger.exception("Could not read main.json")
+        with open(file_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig strips BOM
+            item_data = json.load(f)
+    except json.JSONDecodeError as e:
+        item_data_error = f"Invalid JSON in {ITEM_DATA_FILE}: {e}"
+        app.logger.error(f"[loader] {item_data_error}")
+        print(f"[loader] {item_data_error}")
+        return None
+    except Exception as e:
+        item_data_error = f"Unexpected error reading {ITEM_DATA_FILE}: {e}"
+        app.logger.error(f"[loader] {item_data_error}")
+        print(f"[loader] {item_data_error}")
+        return None
+
+    # Guard against main.json containing `null`
+    if item_data is None:
+        item_data_error = f"{ITEM_DATA_FILE} parsed to null (root must be an array of items)"
+        print(f"[loader] {item_data_error}")
+        return None
+
+    if not isinstance(item_data, list):
+        item_data_error = f"{ITEM_DATA_FILE} must be a JSON array, got {type(item_data).__name__}"
+        print(f"[loader] {item_data_error}")
+        item_data = None
+        return None
+
+    item_data_error = None
+    app.logger.info(f"[loader] Loaded {len(item_data)} items from {ITEM_DATA_FILE}")
+    print(f"[loader] Loaded {len(item_data)} items from {ITEM_DATA_FILE}")
+    return item_data
+
+
+def find_item(item_id):
+    """Find an item by ID, tolerating both 'Id' and 'itemID' key spellings."""
+    if item_data is None:
+        return None
+    for item in item_data:
+        if item.get("Id") == item_id or item.get("itemID") == item_id:
+            return item
     return None
 
 
-def find_item_image(item_id):
-    """Find an item image in the configured GitHub repositories."""
-    session = requests.Session()
-    for repo_num in range(1, 7):
-        first_batch = 1 if repo_num == 1 else (repo_num - 1) * 6 + 1
-        last_batch = 6 if repo_num == 1 else first_batch + 5
-        for batch_num in range(first_batch, last_batch + 1):
-            url = (
-                f"https://raw.githubusercontent.com/djdndbdjfi/"
-                f"free-fire-items-{repo_num}/main/items/"
-                f"batch-{batch_num:02d}/{item_id}.png"
-            )
-            try:
-                response = session.head(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                if response.status_code == 200:
-                    return url
-            except requests.RequestException:
-                app.logger.warning("Image lookup failed for %s", url)
-    return None
+# Load on startup
+with app.app_context():
+    load_item_data()
 
 
-@app.get("/item-image")
+# ---------- DIAGNOSTIC ENDPOINT ----------
+@app.route('/health')
+def health():
+    """Hit this to see exactly why item data isn't loading."""
+    return jsonify({
+        "item_data_loaded": item_data is not None,
+        "item_count": len(item_data) if isinstance(item_data, list) else 0,
+        "error": item_data_error,
+        "base_dir": BASE_DIR,
+        "main_json_path": os.path.join(BASE_DIR, ITEM_DATA_FILE),
+        "main_json_exists": os.path.exists(os.path.join(BASE_DIR, ITEM_DATA_FILE)),
+        "background_dir_exists": os.path.isdir(os.path.join(BASE_DIR, BACKGROUND_FOLDER)),
+    }), 200
+
+
+@app.route('/reload')
+def reload_data():
+    """Force a reload (useful after fixing main.json)."""
+    load_item_data(force=True)
+    return jsonify({"ok": item_data is not None, "count": len(item_data) if item_data else 0,
+                    "error": item_data_error})
+
+
+# ---------- EXISTING ENDPOINTS ----------
+@app.route('/item-image')
 def get_item_image():
-    """Redirect to the original item PNG hosted on jsDelivr."""
-    item_id = request.args.get("id", "").strip()
-    key = request.args.get("key", "")
+    item_id = request.args.get('id')
+    key = request.args.get('key')
 
-    if key != os.environ.get("ITEM_IMAGE_API_KEY", "SAGAR"):
+    if key != 'SAGAR':
         abort(403, description="Invalid key")
     if not item_id:
         abort(400, description="Item ID is required")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item_id):
-        abort(400, description="Invalid item ID")
 
     image_url = f"https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG/{item_id}.png"
     try:
-        response = requests.head(image_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = requests.head(image_url, timeout=5)
         if response.status_code != 200:
             abort(404, description="Item image not found")
-        return redirect(image_url, code=302)
+        return redirect(image_url)
     except requests.RequestException:
         abort(502, description="Failed to connect to image server")
 
 
-@app.get("/iteminfo")
+@app.route('/iteminfo', methods=['GET'])
 def get_item_info():
-    """Return item details from main.json using ?id=."""
-    item_id = request.args.get("id", type=int)
+    item_id = request.args.get('id', type=int)
     if item_id is None:
-        return jsonify({"error": "Missing or invalid required parameter: id"}), 400
+        return jsonify({"error": "Missing required parameter: id"}), 400
 
-    data = load_item_data()
-    if data is None:
-        return jsonify({"error": "Item data not loaded. Check that main.json is deployed and valid."}), 500
+    if item_data is None:
+        # Retry once — main.json may have been fixed without a restart
+        load_item_data(force=True)
+    if item_data is None:
+        return jsonify({
+            "error": "Item data not loaded.",
+            "detail": item_data_error,
+        }), 500
 
-    item = next((entry for entry in data if entry.get("Id") == item_id), None)
-    if item is None:
+    item = find_item(item_id)
+    if not item:
         return jsonify({"error": f"Item with ID {item_id} not found."}), 404
     return jsonify(item), 200
 
 
-@app.get("/main/ICON/<int:itemid>.png")
+@app.route('/main/ICON/<int:itemid>.png', methods=['GET'])
 def get_combined_item_image(itemid):
-    """Generate a composite PNG using the item's rarity background."""
-    data = load_item_data()
-    if data is None:
-        return jsonify({"error": "Item data not loaded. Check that main.json is deployed and valid."}), 500
+    if item_data is None:
+        load_item_data(force=True)
+    if item_data is None:
+        return jsonify({
+            "error": "Item data not loaded.",
+            "detail": item_data_error,
+        }), 500
 
-    item = next((entry for entry in data if entry.get("itemID") == itemid), None)
-    if item is None:
+    item_found = find_item(itemid)
+    if not item_found:
+        app.logger.warning(f"Item {itemid} not in main.json")
         return jsonify({"error": f"Item with ID {itemid} not found."}), 404
 
-    rare_type = str(item.get("Rare", "Default"))
-    # Only allow a simple filename to prevent paths escaping the background folder.
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", rare_type):
-        rare_type = "Default"
+    rare_type = item_found.get("Rare", "Default") or "Default"
+    background_image_path = os.path.join(BASE_DIR, BACKGROUND_FOLDER, f'{rare_type}.png')
 
-    background_path = BACKGROUND_FOLDER / f"{rare_type}.png"
-    if not background_path.is_file():
-        background_path = DEFAULT_BACKGROUND_IMAGE
-    if not background_path.is_file():
-        return jsonify({"error": "Background image not found and default is missing."}), 500
+    if not os.path.exists(background_image_path):
+        app.logger.warning(f"Background for Rare='{rare_type}' missing; using default.")
+        background_image_path = os.path.join(BASE_DIR, DEFAULT_BACKGROUND_IMAGE)
+        if not os.path.exists(background_image_path):
+            return jsonify({"error": "Background image not found and default is missing."}), 500
 
     try:
-        with Image.open(background_path) as source:
-            background = source.convert("RGBA")
-    except (OSError, UnidentifiedImageError):
-        app.logger.exception("Could not load background image: %s", background_path)
+        background = Image.open(background_image_path).convert("RGBA")
+    except Exception as e:
+        app.logger.error(f"Background load error: {e}")
         return jsonify({"error": "Could not load background image."}), 500
 
-    image_url = find_item_image(itemid)
-    if not image_url:
+    # Find item image across repos
+    item_image_url = None
+    for repo_num in range(1, 7):
+        if repo_num == 1:
+            batch_range = range(1, 7)
+        else:
+            start_batch = (repo_num - 1) * 6 + 1
+            batch_range = range(start_batch, start_batch + 6)
+        for batch_num in batch_range:
+            batch_str = f"{batch_num:02d}"
+            url = (f"https://raw.githubusercontent.com/djdndbdjfi/free-fire-items-{repo_num}"
+                   f"/main/items/batch-{batch_str}/{itemid}.png")
+            try:
+                if requests.head(url, timeout=5).status_code == 200:
+                    item_image_url = url
+                    break
+            except requests.RequestException:
+                continue
+        if item_image_url:
+            break
+
+    if not item_image_url:
         return jsonify({"error": f"Item image for ID {itemid} not found."}), 404
 
     try:
-        response = requests.get(image_url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        with Image.open(io.BytesIO(response.content)) as source:
-            item_image = source.convert("RGBA")
-    except requests.RequestException:
-        app.logger.exception("Could not fetch item image for ID %s", itemid)
-        return jsonify({"error": "Could not fetch item image from GitHub."}), 502
-    except (OSError, UnidentifiedImageError):
-        app.logger.exception("Invalid image returned for item ID %s", itemid)
-        return jsonify({"error": "External API did not return a valid image."}), 502
+        r = requests.get(item_image_url, timeout=15)
+        r.raise_for_status()
+        item_image = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except requests.RequestException as e:
+        return jsonify({"error": f"Could not fetch item image: {e}"}), 502
+    except Image.UnidentifiedImageError:
+        return jsonify({"error": "External source did not return a valid image."}), 502
 
-    bg_width, bg_height = background.size
-    target_width, target_height = int(bg_width * 0.8), int(bg_height * 0.8)
-    item_width, item_height = item_image.size
-    scale = min(target_width / item_width, target_height / item_height)
-    new_size = (max(1, int(item_width * scale)), max(1, int(item_height * scale)))
-    item_image = item_image.resize(new_size, Image.Resampling.LANCZOS)
+    # Resize to 80% with preserved aspect ratio
+    bg_w, bg_h = background.size
+    target_w, target_h = int(bg_w * 0.8), int(bg_h * 0.8)
+    iw, ih = item_image.size
+    item_ratio = iw / ih
+    target_ratio = target_w / target_h
+    if item_ratio > target_ratio:
+        new_w, new_h = target_w, int(target_w / item_ratio)
+    else:
+        new_h, new_w = target_h, int(target_h * item_ratio)
+    item_image = item_image.resize((new_w, new_h), Image.LANCZOS)
 
-    x = (bg_width - new_size[0]) // 2
-    y = (bg_height - new_size[1]) // 2
     layer = Image.new("RGBA", background.size, (0, 0, 0, 0))
-    layer.paste(item_image, (x, y), item_image)
+    layer.paste(item_image, ((bg_w - new_w) // 2, (bg_h - new_h) // 2), item_image)
     combined = Image.alpha_composite(background, layer)
 
-    output = io.BytesIO()
-    combined.save(output, format="PNG")
-    output.seek(0)
-    return send_file(output, mimetype="image/png", download_name=f"item_{itemid}.png")
+    buf = io.BytesIO()
+    combined.save(buf, format='PNG')
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png', as_attachment=False,
+                     download_name=f'item_{itemid}.png')
 
 
-@app.get("/")
-def health_check():
-    return jsonify({"status": "ok", "message": "Item API is running on Vercel."}), 200
-
-
-@app.errorhandler(400)
-@app.errorhandler(403)
-@app.errorhandler(404)
-@app.errorhandler(502)
-def handle_http_error(error):
-    return jsonify({"error": error.description}), error.code
-
-
-@app.errorhandler(500)
-def handle_server_error(error):
-    app.logger.exception("Internal server error")
-    return jsonify({"error": "Internal server error"}), 500
+if __name__ == '__main__':
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    print(f"[🚀] Starting JWT-API on port {port} ...")
+    app.run(host='0.0.0.0', port=port, debug=False)
